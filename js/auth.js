@@ -1,41 +1,20 @@
 /**
  * auth.js
  * Prototype authentication using localStorage.
- *
- * FIX v2.2 — changes from v2.1:
- *
- * 1. logoutUser() — now checks the Remember Me flag before clearing the
- *    session.  When the user logged in with Remember Me enabled, logout
- *    only clears the session token (mh_current_user) if the user explicitly
- *    clicks Logout.  The flag itself is also cleared so the next page load
- *    shows the login screen instead of auto-restoring.
- *    Previously logoutUser() ALWAYS cleared mh_current_user and mh_remember
- *    unconditionally, which meant a "Remember Me" login had no effect after
- *    the browser was closed and reopened.
- *
- * 2. seedDemoAccount() — the demo account is seeded ONLY when no users exist
- *    at all.  After registerUser() auto-logs the new demo account in, we now
- *    call clearCurrentUser() inside a try/finally block so the auto-login is
- *    always cleaned up even if an unexpected error occurs.
- *
- * 3. loginUser() — saves the Remember Me flag using the new saveRemember()
- *    helper from storage.js (value: 'permanent') instead of the raw
- *    localStorage.setItem call, so the key is tracked centrally.
- *
  * NOTE: localStorage is NOT secure for production.
- *       Passwords are obfuscated (not cryptographically hashed).
- *       Replace with a real backend + bcrypt/argon2 before going live.
+ *       Replace with real backend API calls when deploying.
  */
 
-// ── Password obfuscation ──────────────────────────────────────────────────────
+// ── Utility ───────────────────────────────────────────────────────────────────
 
 function hashPassword(password) {
-  // Simple bit-mixing for prototype only — NOT cryptographically secure.
+  // Simple obfuscation for prototype — NOT cryptographically secure.
+  // Replace with bcrypt/argon2 on a real server.
   let hash = 0;
   for (let i = 0; i < password.length; i++) {
     const chr = password.charCodeAt(i);
     hash = ((hash << 5) - hash) + chr;
-    hash |= 0; // convert to 32-bit integer
+    hash |= 0;
   }
   return hash.toString(16);
 }
@@ -45,40 +24,33 @@ function hashPassword(password) {
 /**
  * Register a new user.
  * Returns { success: true, user } or { success: false, error: 'key' }
- *
- * Duplicate check: case-insensitive match on BOTH username AND email.
- * A new user ID is generated exactly once here and never regenerated.
  */
 function registerUser({ fullName, username, email, password }) {
   const users = getUsersRaw();
-  const usernameLower = username.trim().toLowerCase();
-  const emailLower    = email.trim().toLowerCase();
 
-  // Reject if either identifier already exists
-  if (users.find(u =>
-    u.username.toLowerCase() === usernameLower ||
-    u.email.toLowerCase()    === emailLower
-  )) {
+  // Check duplicates
+  if (users.find(u => u.username.toLowerCase() === username.toLowerCase() ||
+                      u.email.toLowerCase() === email.toLowerCase())) {
     return { success: false, error: 'userExists' };
   }
 
   const user = {
-    id:           generateId(),
-    fullName:     fullName.trim(),
-    username:     username.trim(),
-    email:        emailLower,
+    id:          generateId(),
+    fullName:    fullName.trim(),
+    username:    username.trim(),
+    email:       email.trim().toLowerCase(),
     passwordHash: hashPassword(password),
-    avatar:       null,
-    createdAt:    new Date().toISOString(),
-    bio:          '',
-    school:       '',
-    grade:        '',
+    avatar:      null,
+    createdAt:   new Date().toISOString(),
+    bio:         '',
+    school:      '',
+    grade:       '',
   };
 
   users.push(user);
   saveUsersRaw(users);
 
-  // Auto-login: expose a copy without the password hash
+  // Auto-login
   const sessionUser = { ...user };
   delete sessionUser.passwordHash;
   saveCurrentUserRaw(sessionUser);
@@ -88,18 +60,14 @@ function registerUser({ fullName, username, email, password }) {
 
 /**
  * Login an existing user.
- * Accepts email OR username (case-insensitive).
- *
- * FIX: uses saveRemember() / clearRemember() from storage.js instead of
- * raw localStorage calls so the key is included in clearAllStorage().
+ * Accepts email or username.
  */
 function loginUser({ emailOrUsername, password, remember }) {
   const users = getUsersRaw();
-  const ident = (emailOrUsername || '').trim().toLowerCase();
+  const ident = emailOrUsername.trim().toLowerCase();
 
   const found = users.find(u =>
-    u.email.toLowerCase()    === ident ||
-    u.username.toLowerCase() === ident
+    u.email === ident || u.username.toLowerCase() === ident
   );
 
   if (!found || found.passwordHash !== hashPassword(password)) {
@@ -110,64 +78,48 @@ function loginUser({ emailOrUsername, password, remember }) {
   delete sessionUser.passwordHash;
   saveCurrentUserRaw(sessionUser);
 
-  // FIX: store the remember flag through the central helper so it is
-  // included in clearAllStorage() and visible in STORAGE_KEYS.
   if (remember) {
-    saveRemember('permanent');
+    localStorage.setItem('mh_remember', '1');
   } else {
-    clearRemember();
+    localStorage.removeItem('mh_remember');
   }
 
   return { success: true, user: sessionUser };
 }
 
-/**
- * Logout the current user.
- *
- * FIX v2.2: previously this always cleared BOTH mh_current_user and
- * mh_remember, making Remember Me useless — the session was gone the moment
- * the user clicked Logout, and the flag was also gone so the next load
- * couldn't restore anything.
- *
- * New behaviour:
- *  • Always clear mh_current_user (end the active UI session).
- *  • Always clear mh_remember (the user explicitly chose to log out,
- *    so we should not auto-restore them on the next page load).
- *
- * This is the correct behaviour: logging out means "show me the login
- * screen next time", but the ACCOUNT and all TASKS remain in storage.
- * The user can log back in with the same credentials and see all their data.
- */
+/** Logout current user. */
 function logoutUser() {
-  clearCurrentUser();   // end the UI session
-  clearRemember();      // do not auto-restore on next page load
+  clearCurrentUser();
+  localStorage.removeItem('mh_remember');
 }
 
-/** Get the currently logged-in user object (without passwordHash), or null. */
+/** Get current logged-in user (or null). */
 function getCurrentUser() {
   return getCurrentUserRaw();
 }
 
-/** True if a valid session object is stored. */
+/** Check if a user session exists. */
 function isLoggedIn() {
   return getCurrentUserRaw() !== null;
 }
 
 /**
- * Update allowed profile fields for the current user.
- * Does NOT touch the password — use changePassword() for that.
+ * Update the current user's profile fields.
+ * Does NOT update password — use changePassword() for that.
  */
 function updateProfile(fields) {
   const current = getCurrentUserRaw();
   if (!current) return { success: false };
 
   const users = getUsersRaw();
-  const idx   = users.findIndex(u => u.id === current.id);
+  const idx = users.findIndex(u => u.id === current.id);
   if (idx === -1) return { success: false };
 
   const allowed = ['fullName', 'username', 'email', 'bio', 'school', 'grade', 'avatar'];
   allowed.forEach(k => {
-    if (fields[k] !== undefined) users[idx][k] = fields[k];
+    if (fields[k] !== undefined) {
+      users[idx][k] = fields[k];
+    }
   });
 
   saveUsersRaw(users);
@@ -180,15 +132,14 @@ function updateProfile(fields) {
 }
 
 /**
- * Change the current user's password.
- * Requires the correct current password.
+ * Change current user's password.
  */
 function changePassword({ currentPassword, newPassword }) {
   const current = getCurrentUserRaw();
   if (!current) return { success: false, error: 'fieldRequired' };
 
   const users = getUsersRaw();
-  const idx   = users.findIndex(u => u.id === current.id);
+  const idx = users.findIndex(u => u.id === current.id);
   if (idx === -1) return { success: false };
 
   if (users[idx].passwordHash !== hashPassword(currentPassword)) {
@@ -204,37 +155,20 @@ function changePassword({ currentPassword, newPassword }) {
 // ── Demo account seeder ───────────────────────────────────────────────────────
 
 /**
- * seedDemoAccount()
- *
- * Creates ONE demo account the very first time the app runs on a fresh
- * storage origin (i.e. mh_users is empty).
- *
- * FIX v2.2:
- *  • The guard `if (users.length > 0) return` prevents the demo account
- *    from ever overwriting real accounts.
- *  • registerUser() internally calls saveCurrentUserRaw() (auto-login).
- *    We MUST call clearCurrentUser() afterwards so the demo account does
- *    not appear logged-in without a password entry.  The clearCurrentUser()
- *    call is now wrapped in try/finally so it always runs even if something
- *    unexpected throws between the two calls.
- *
- * Demo credentials: demo@memoryhelper.app / demo1234
+ * Seed a demo account if no users exist.
+ * Demo: email: demo@memoryhelper.app  password: demo1234
  */
 function seedDemoAccount() {
   const users = getUsersRaw();
-  if (users.length > 0) return; // real accounts exist — do nothing
+  if (users.length > 0) return;
 
-  try {
-    registerUser({
-      fullName: 'Demo Student',
-      username: 'demostudent',
-      email:    'demo@memoryhelper.app',
-      password: 'demo1234',
-    });
-  } finally {
-    // Always remove the auto-login that registerUser() created, so the
-    // login form is shown instead of jumping straight into the demo account.
-    clearCurrentUser();
-    clearRemember();
-  }
+  registerUser({
+    fullName: 'Demo Student',
+    username: 'demostudent',
+    email:    'demo@memoryhelper.app',
+    password: 'demo1234',
+  });
+
+  // Clear the auto-login from register so the login page is shown
+  clearCurrentUser();
 }

@@ -15,82 +15,14 @@ const App = {
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
-  // 1. Seed a demo account only if the user database is completely empty.
-  //    This never overwrites real accounts.
   seedDemoAccount();
-
   applyTheme(getTheme());
   applyTranslations();
   updateLangToggle();
 
-  // 2. FIX: Determine whether to auto-restore a session.
-  //
-  //    The old code only called isLoggedIn() which checks mh_current_user.
-  //    That worked for a tab refresh (session object still present) but NOT
-  //    for "close browser → reopen" because browsers may clear sessionStorage
-  //    on close.  However, localStorage survives browser restarts, so
-  //    mh_current_user IS still there after a restart — meaning the old code
-  //    actually worked for Remember Me users already.
-  //
-  //    The real gap was: the user logs OUT (which clears mh_current_user),
-  //    then reopens the page.  At that point isLoggedIn() returns false and
-  //    the app showed the login screen — correct.  But the user's account
-  //    and tasks were still in localStorage, so they could log back in.
-  //
-  //    What was truly broken: Remember Me flag was stored but NEVER read
-  //    on startup, so it had no effect.  We now read it here:
-  //      • If mh_current_user is present  → session is active, go straight in.
-  //      • If mh_current_user is absent
-  //          AND mh_remember === 'permanent'  → try to rehydrate (see below).
-  //      • Otherwise → show login screen.
-  //
-  //    Rehydration from Remember Me:
-  //    After a logout the session (mh_current_user) is cleared and
-  //    mh_remember is also cleared (see logoutUser() fix in auth.js).
-  //    So "permanent" remember only survives when the BROWSER was closed
-  //    without the user clicking Logout.  In that case we restore the last
-  //    active user automatically.
-  //
-  //    FIX: also run migrateOrphanReminders so tasks saved without a userId
-  //    (older app versions) become visible to the logged-in user.
-
   if (isLoggedIn()) {
-    // Active session in localStorage (tab refresh, or browser reopen without
-    // having logged out).
-    const user = getCurrentUser();
-    const migrated = migrateOrphanReminders(user.id);
-    if (migrated > 0) {
-      console.info('[Memory Helper] Migrated ' + migrated + ' orphan reminder(s) to user ' + user.id);
-    }
     showApp();
     navigateTo('dashboard');
-  } else if (getRemember() === 'permanent') {
-    // Browser was closed without logout AND the user had Remember Me on.
-    // mh_current_user was cleared externally (e.g. private-browsing quirk),
-    // but we can look up the last user via the users array.
-    // We pick the most-recently-created real (non-demo) user, or fall back
-    // to the demo account as a last resort.
-    const users = getUsersRaw();
-    const candidate = users
-      .filter(u => u.email !== 'demo@memoryhelper.app')
-      .sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''))
-      [0] || users[0];
-
-    if (candidate) {
-      const sessionUser = { ...candidate };
-      delete sessionUser.passwordHash;
-      saveCurrentUserRaw(sessionUser);
-
-      const migrated = migrateOrphanReminders(sessionUser.id);
-      if (migrated > 0) {
-        console.info('[Memory Helper] Migrated ' + migrated + ' orphan reminder(s) to user ' + sessionUser.id);
-      }
-      showApp();
-      navigateTo('dashboard');
-    } else {
-      clearRemember();
-      showAuth('login');
-    }
   } else {
     showAuth('login');
   }
@@ -179,10 +111,6 @@ function renderAuthForm(mode) {
         </form>
         <p class="auth-switch">${t('noAccount')} <a href="#" id="switchToRegister">${t('registerNow')}</a></p>
         <p class="auth-demo-hint">Demo: <strong>demo@memoryhelper.app</strong> / <strong>demo1234</strong></p>
-        <p class="auth-origin-hint" id="authOriginHint"></p>
-        <div class="auth-portal-link">
-          <a href="../school-map/index.html" class="btn-portal-link">🗺️ School Map — แผนที่โรงเรียนวัดป่าประดู่</a>
-        </div>
       </div>`;
   } else {
     container.innerHTML = `
@@ -224,9 +152,6 @@ function renderAuthForm(mode) {
           <button type="submit" class="btn btn-primary btn-block">${t('register')}</button>
         </form>
         <p class="auth-switch">${t('haveAccount')} <a href="#" id="switchToLogin">${t('loginNow')}</a></p>
-        <div class="auth-portal-link">
-          <a href="../school-map/index.html" class="btn-portal-link">🗺️ School Map — แผนที่โรงเรียนวัดป่าประดู่</a>
-        </div>
       </div>`;
   }
   bindAuthEvents(mode);
@@ -238,19 +163,6 @@ function bindAuthEvents(mode) {
     document.getElementById('switchToRegister')?.addEventListener('click', e => { e.preventDefault(); renderAuthForm('register'); });
     document.getElementById('loginPwToggle')?.addEventListener('click', () => togglePwVisibility('loginPassword', 'loginPwToggle'));
     document.getElementById('loginForm')?.addEventListener('submit', handleLogin);
-
-    // FIX: Show the current browser origin so the user can confirm they are
-    // opening the site from the same address as before.  LocalStorage is
-    // scoped to the origin (scheme + host + port), so switching from
-    // http://127.0.0.1:5500 to http://localhost:5500 means a different
-    // storage partition and previously saved accounts will not appear.
-    const hintEl = document.getElementById('authOriginHint');
-    if (hintEl) {
-      const origin = window.location.origin || window.location.protocol + '//' + window.location.host;
-      hintEl.textContent = '🔒 ' + (getLang() === 'th'
-        ? 'ข้อมูลบันทึกอยู่ที่: ' + origin
-        : 'Data stored at: ' + origin);
-    }
   } else {
     document.getElementById('switchToLogin')?.addEventListener('click', e => { e.preventDefault(); renderAuthForm('login'); });
     document.getElementById('regPwToggle')?.addEventListener('click', () => togglePwVisibility('regPassword', 'regPwToggle'));
@@ -278,14 +190,6 @@ function handleLogin(e) {
   if (!valid) return;
   const result = loginUser({ emailOrUsername, password, remember });
   if (!result.success) { setFieldError('loginGlobalErr', t(result.error)); return; }
-
-  // FIX: migrate any reminders that were saved without a userId so they
-  // become visible to this user immediately after login.
-  const migrated = migrateOrphanReminders(result.user.id);
-  if (migrated > 0) {
-    console.info('[Memory Helper] handleLogin: migrated ' + migrated + ' orphan reminder(s) to user ' + result.user.id);
-  }
-
   showToast(t('loginSuccess'), 'success');
   showApp();
   navigateTo('dashboard');
@@ -311,14 +215,6 @@ function handleRegister(e) {
   if (!valid) return;
   const result = registerUser({ fullName, username, email, password });
   if (!result.success) { setFieldError('regConfirmPwErr', t(result.error)); return; }
-
-  // FIX: migrate orphan reminders to the newly registered user so any tasks
-  // saved before an account existed are not lost.
-  const migrated = migrateOrphanReminders(result.user.id);
-  if (migrated > 0) {
-    console.info('[Memory Helper] handleRegister: migrated ' + migrated + ' orphan reminder(s) to new user ' + result.user.id);
-  }
-
   showToast(t('registerSuccess'), 'success');
   showApp();
   navigateTo('dashboard');
@@ -1071,13 +967,7 @@ function handleImport(e) {
 }
 
 function handleClearData() {
-  // FIX: use a stronger, explicit confirmation message so the user
-  // understands exactly what will be deleted (tasks + messages only;
-  // accounts and subject/teacher names are kept).
-  const msg = getLang() === 'th'
-    ? 'ลบงานและข้อความทั้งหมดหรือไม่?\n\nบัญชีผู้ใช้และข้อมูลวิชา/ครูจะยังคงอยู่\nการกระทำนี้ไม่สามารถย้อนกลับได้'
-    : 'Delete ALL tasks and messages?\n\nUser accounts and subject/teacher names will be kept.\nThis cannot be undone.';
-  showConfirm(msg, () => {
+  showConfirm(t('confirmClearData'), () => {
     clearAppData();
     showToast(t('dataCleaned'), 'success');
     renderPage(App.currentPage);
